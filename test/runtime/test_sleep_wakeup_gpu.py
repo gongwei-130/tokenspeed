@@ -43,7 +43,7 @@ def main() -> None:
     engine = Engine(
         model=model,
         enable_memory_saver=True,
-        gpu_memory_utilization=0.1,
+        gpu_memory_utilization=float(os.environ.get("GMU", "0.1")),
         max_model_len=2048,
         trust_remote_code=True,
         log_level="info",
