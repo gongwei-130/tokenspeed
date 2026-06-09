@@ -147,12 +147,17 @@ def gdn_chunk_prefill(
         H_state = fi_initial_state.shape[1]
         D_state = fi_initial_state.shape[-1]
         state_checkpoints = torch.empty(
-            total_ckpts_fi, H_state, D_state, D_state,
-            device=fi_initial_state.device, dtype=torch.float32,
+            total_ckpts_fi,
+            H_state,
+            D_state,
+            D_state,
+            device=fi_initial_state.device,
+            dtype=torch.float32,
         )
         checkpoint_cu_starts = torch.zeros(
             per_seq_ckpts_fi.numel() + 1,
-            device=fi_initial_state.device, dtype=torch.int64,
+            device=fi_initial_state.device,
+            dtype=torch.int64,
         )
         checkpoint_cu_starts[1:] = torch.cumsum(per_seq_ckpts_fi, dim=0)
 
