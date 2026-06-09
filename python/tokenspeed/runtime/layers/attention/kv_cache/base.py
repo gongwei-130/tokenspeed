@@ -100,7 +100,18 @@ class BaseTokenToKVPool:
         covered without per-class overrides. For non-quantized KV this is
         belt-and-suspenders (paging overwrites); for FP8 KV it removes garbage.
         """
-        for attr in ("k_buffer", "v_buffer", "kv_buffer"):
+        attrs = (
+            "k_buffer",
+            "v_buffer",
+            "kv_buffer",
+            # DeepSeek V4 pool buffer names.
+            "swa_kv_buffer",
+            "compressed_kv_buffer",
+            "compressor_state_buffer",
+            "indexer_kv_buffer",
+            "indexer_state_buffer",
+        )
+        for attr in attrs:
             for entry in getattr(self, attr, None) or []:
                 items = entry if isinstance(entry, (tuple, list)) else (entry,)
                 for t in items:
