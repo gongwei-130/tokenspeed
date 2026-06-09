@@ -35,11 +35,18 @@ Modified:
 
 ---
 
-## Phase 0 — nv2 feasibility gate (do FIRST, before writing code)
+## Phase 0 — nv2 feasibility gate (COMPLETED 2026-06-08 on `v2`/b300, 8×B300 SXM6, cu130/torch-2.11)
 
-Three design assumptions can only be confirmed on a B200 box (`torch_memory_saver` is not installed on the dev Mac). Confirm them before committing to the tag API shape.
+**Findings (recorded; these refine Tasks 2, 6, 10, 11, 12):**
 
-### Task 0: Verify torch_memory_saver tag API + KV scale location on nv2
+- **Package:** `torch_memory_saver==0.0.9.post1` — single `manylinux2014` wheel (`cp39-abi3`) that **bundles** the cu13 binaries (`torch_memory_saver_hook_mode_preload_cu13.abi3.so`, `..._torch_cu13.abi3.so`) at the site-packages root. Installs clean via `pip install --break-system-packages` (no nvcc needed). `_detect_cuda_major()` → 13. **NOT preinstalled in the runner image** (`lightseekorg/tokenspeed-runner:latest`) → must be added (image build or runtime install); pin in Task 12.
+- **Tag API (confirmed):** `region(tag: str = 'default', enable_cpu_backup: bool = False)`, `pause(tag=None)`, `resume(tag=None)`. The `enable_cpu_backup` flag on `region()` is the offload-vs-discard knob: **weights → `enable_cpu_backup=True`** (byte-exact CPU restore), **kv_cache → `enable_cpu_backup=False`** (discard). This replaces vLLM's pause-time `offload_tags`.
+- **Functional proof on B300:** alloc 2 GiB (1 weights + 1 kv) → `pause` freed exactly 2.00 GiB → `resume` restored, weights **byte-exact** → partial wake (weights only) correctly left KV freed (1.10 GiB used). Mechanism works on this driver/torch stack.
+- **Hook mode:** **`preload` is required** — it is the only mode that supports pauseable CUDA graphs (entrypoint.py:96; TokenSpeed uses cudagraphs). It needs `LD_PRELOAD` = the preload `.so`, set via `configure_subprocess()`. **Already wired** at `entrypoints/engine.py:528` (non-DP path wraps `proc.start()`); **verify the DP path** (`data_parallel_controller.py`) propagates it (Task 14 Case G).
+- **FP8 KV scales:** live on the attention `layer` (`layer.k_scale`, `layer.v_scale`, `layer.k_scale_float`) — i.e. in the **weights** region, restored by `resume(["weights"])`. So KV repair = **zero the KV buffer only**; no scale reset (confirms Task 6 `_kv_repair_after_wake`).
+- **deepseek_v4:** `kv_cache/deepseek_v4.py:~793` does `del enable_memory_saver` and never wraps its KV allocation — the V4 model needs explicit region wrapping at its real buffer-alloc site (Task 11). Initial validation uses a small MHA model (e.g. Qwen2-1.5B) where `mha.py` wrapping suffices.
+
+### Task 0: (DONE) Verify torch_memory_saver tag API + KV scale location on nv2
 
 **Files:** none (investigation; record findings in the plan/PR).
 
@@ -184,7 +191,9 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaver
 
 def test_noop_adapter_accepts_tag_kwarg():
     a = TorchMemorySaverAdapter.create(enable=False)
-    with a.region(tag="weights"):
+    with a.region(tag="weights", enable_cpu_backup=True):
+        pass
+    with a.region(tag="kv_cache", enable_cpu_backup=False):
         pass
     a.pause(tag="weights")   # no-op, must not raise
     a.resume(tag="weights")  # no-op, must not raise
@@ -209,7 +218,7 @@ class TorchMemorySaverAdapter(ABC):
     def configure_subprocess(self):
         raise NotImplementedError
 
-    def region(self, tag: str | None = None):
+    def region(self, tag: str | None = None, enable_cpu_backup: bool = False):
         raise NotImplementedError
 
     def pause(self, tag: str | None = None):
@@ -223,8 +232,11 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
     def configure_subprocess(self):
         return torch_memory_saver.configure_subprocess()
 
-    def region(self, tag: str | None = None):
-        return _primary_memory_saver.region(tag=tag)
+    def region(self, tag: str | None = None, enable_cpu_backup: bool = False):
+        # tag defaults to "default" in the lib; pass through explicitly.
+        return _primary_memory_saver.region(
+            tag=tag or "default", enable_cpu_backup=enable_cpu_backup
+        )
 
     def pause(self, tag: str | None = None):
         return _primary_memory_saver.pause(tag=tag)
@@ -239,7 +251,7 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
         yield
 
     @contextmanager
-    def region(self, tag: str | None = None):
+    def region(self, tag: str | None = None, enable_cpu_backup: bool = False):
         yield
 
     def pause(self, tag: str | None = None):
@@ -249,7 +261,7 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
         pass
 ```
 
-> **nv2 note (from Task 0):** if the installed `torch_memory_saver`'s `region/pause/resume` do NOT accept `tag=`, change `_TorchMemorySaverAdapterReal` to keep a `dict[str, TorchMemorySaver]` keyed by tag and dispatch to the per-tag instance instead. Keep the adapter interface (`tag=...`) identical so nothing downstream changes.
+> **Confirmed on nv2 (Task 0):** `torch_memory_saver==0.0.9.post1` exposes exactly `region(tag, enable_cpu_backup)`, `pause(tag)`, `resume(tag)`. `enable_cpu_backup=True` → contents restored byte-exact on resume (weights); `False` → discarded (kv_cache).
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1115,15 +1127,15 @@ git commit -s -m "feat(http): /release_memory_occupation /resume_memory_occupati
 - Modify: `python/tokenspeed/runtime/layers/attention/kv_cache/mla.py:85`
 - Modify: `python/tokenspeed/runtime/cache/req_to_token_pool.py:65`
 
-- [ ] **Step 1: Tag weights**
+- [ ] **Step 1: Tag weights (with CPU backup so weights restore on wake)**
 
-`weight_loader.py:86`: `with memory_saver_adapter.region():` → `with memory_saver_adapter.region(tag="weights"):`
+`weight_loader.py:86`: `with memory_saver_adapter.region():` → `with memory_saver_adapter.region(tag="weights", enable_cpu_backup=True):`
 
-- [ ] **Step 2: Tag KV (MHA + MLA + req_to_token)**
+- [ ] **Step 2: Tag KV (MHA + MLA + req_to_token) — discard on sleep (no CPU backup)**
 
-- `mha.py:102`: `with self.memory_saver_adapter.region():` → `region(tag="kv_cache")`
-- `mla.py:85`: `with memory_saver_adapter.region():` → `region(tag="kv_cache")`
-- `req_to_token_pool.py:65`: `with memory_saver_adapter.region():` → `region(tag="kv_cache")`
+- `mha.py:102`: `with self.memory_saver_adapter.region():` → `region(tag="kv_cache", enable_cpu_backup=False)`
+- `mla.py:85`: `with memory_saver_adapter.region():` → `region(tag="kv_cache", enable_cpu_backup=False)`
+- `req_to_token_pool.py:65`: `with memory_saver_adapter.region():` → `region(tag="kv_cache", enable_cpu_backup=False)`
 
 - [ ] **Step 3: Import-smoke each module**
 
@@ -1166,20 +1178,25 @@ git add python/tokenspeed/runtime/layers/attention/kv_cache/deepseek_v4.py
 git commit -s -m "feat(memory-saver): tag deepseek_v4 KV region for sleep/wake"
 ```
 
-### Task 12: Pin torch_memory_saver
+### Task 12: Pin torch_memory_saver + ensure it's in the runner image
 
 **Files:**
 - Modify: `python/pyproject.toml`
+- Modify: the runner image build (`docker/`) OR document a runtime install
 
 - [ ] **Step 1: Add a pinned optional dependency**
 
-Using the version confirmed tag-capable in Task 0, add `torch_memory_saver>=<VER>` to the appropriate optional/extras group in `python/pyproject.toml` (keep it optional — it's CUDA-only and the adapter import-guards it). If an extras group like `[project.optional-dependencies].gpu` exists, add it there.
+Add `torch_memory_saver==0.0.9.post1` (confirmed tag-capable + cu13 binaries bundled, Task 0) to an optional/extras group in `python/pyproject.toml` (keep it optional — it's CUDA-only and the adapter import-guards it). If a group like `[project.optional-dependencies].gpu` exists, add it there.
 
-- [ ] **Step 2: Commit**
+- [ ] **Step 2: Ensure the runner image installs it**
+
+`torch_memory_saver` is NOT in `lightseekorg/tokenspeed-runner:latest` (Task 0). Add `pip install torch_memory_saver==0.0.9.post1` to the image's Dockerfile under `docker/`. For interim nv2 validation it can be installed at container start with `--break-system-packages` (see Task 14 Step 0).
+
+- [ ] **Step 3: Commit**
 
 ```bash
-git add python/pyproject.toml
-git commit -s -m "build: pin tag-capable torch_memory_saver (optional, CUDA-only)"
+git add python/pyproject.toml docker/
+git commit -s -m "build: add tag-capable torch_memory_saver==0.0.9.post1 (optional + runner image)"
 ```
 
 ---
@@ -1220,7 +1237,11 @@ git add -A && git commit -s -m "style: pre-commit formatting for sleep/wake"
 **Files:**
 - Create: `test/runtime/test_sleep_wakeup_gpu.py` (GPU-gated, e.g. `@pytest.mark.skipif(not torch.cuda.is_available())` plus an env opt-in like the existing GPU tests).
 
-Deploy per memory `nv2-logprobs-validation-env` / `pause-api-and-nv2-pyvalidation`: this is **pure Python**, so shadow the package over the existing install and reuse the prebuilt scheduler `.so` — no kernel/scheduler rebuild.
+Deploy per memory `nv2-logprobs-validation-env` / `pause-api-and-nv2-pyvalidation`: this is **pure Python**, so shadow the package over the existing install and reuse the prebuilt scheduler `.so` — no kernel/scheduler rebuild. Use host `v2` (b300), image `lightseekorg/tokenspeed-runner:latest`, `docker run --gpus all --ipc=host`.
+
+- [ ] **Step 0: Install torch_memory_saver in the container**
+
+`pip install --break-system-packages torch_memory_saver==0.0.9.post1` (not preinstalled in the image). Confirm `python3 -c "from torch_memory_saver.utils import _detect_cuda_major; print(_detect_cuda_major())"` → 13. The scheduler subprocess gets `LD_PRELOAD` automatically via the existing `configure_subprocess()` wrap (engine.py:528).
 
 - [ ] **Step 1: Launch a small model with sleep enabled**
 
