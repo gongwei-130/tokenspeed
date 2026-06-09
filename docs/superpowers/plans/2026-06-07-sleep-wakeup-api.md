@@ -1250,7 +1250,32 @@ git add -A && git commit -s -m "style: pre-commit formatting for sleep/wake"
 
 ## Phase 8 — GPU integration on nv2 (multiple cases)
 
-### Task 14: GPU integration tests on B200
+### Task 14: GPU integration tests — RESULTS (2026-06-08, v2/b300, Qwen2-0.5B, GPU 2)
+
+**ALL CASES PASSED** (exit 0). `release_memory_occupation` freed **27304 MiB
+(26.7 GiB)** and flipped `is_sleeping`→True; resume restored to within ~2 MiB.
+Output was **token-identical across the sleep cycle with CUDA graphs enabled**
+(weights restored byte-exact). RL multi-stage tag flow (release both → resume
+weights [still sleeping] → resume kv_cache [awake]) produced coherent text.
+Error paths returned `success=False` (resume not-released; double release).
+
+Plus: **26 unit tests pass in the real GPU env** (incl. adapter tag pass-through
+against the real torch_memory_saver) and **all torch-heavy modules import-smoke
+clean**.
+
+Env-assembly recipe (bare runner image is NOT the full CI runtime): mount a CI
+snapshot's `.local` site-packages at `/snap` (compiled `tokenspeed_scheduler`/
+`_kernel`/`_triton` + deps), PYTHONPATH=`/sw/python:/snap` (my code shadows
+tokenspeed), `pip install --break-system-packages torch_memory_saver==0.0.9.post1`,
+`apt-get install -y libnuma1`, and a `sitecustomize.py` doing
+`site.addsitedir("/snap")` so `.pth` files (e.g. `nvidia_cutlass_dsl.pth` wiring
+`import cutlass`) are processed (PYTHONPATH dirs skip `.pth`).
+
+Not run (single GPU): Case F cudagraph is covered by Case B (graphs on); Case G
+TP/DP idle-forward gate remains for a multi-GPU run; deepseek_v4 (Task 11) is a
+follow-on.
+
+### Task 14 (original): GPU integration tests on B200
 
 **Files:**
 - Create: `test/runtime/test_sleep_wakeup_gpu.py` (GPU-gated, e.g. `@pytest.mark.skipif(not torch.cuda.is_available())` plus an env opt-in like the existing GPU tests).
