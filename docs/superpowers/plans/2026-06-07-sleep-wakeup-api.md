@@ -1012,7 +1012,18 @@ git add python/tokenspeed/runtime/entrypoints/engine.py python/tokenspeed/runtim
 git commit -s -m "feat(engine): is_sleeping(); widen release/resume signatures for tags"
 ```
 
-### Task 9: HTTP routes
+### Task 9: HTTP routes — DEFERRED (follow-up, external packages)
+
+**Decision (2026-06-08):** Ship Python-API-only now; HTTP is a follow-up.
+TokenSpeed's `http_server.py` is a thin client over the **external pinned**
+packages `tokenspeed-smg-grpc-proto` / `tokenspeed-smg-grpc-servicer` (pyproject
+lines 68-69) — control ops go via gRPC RPCs defined there, not via an in-process
+engine client. Adding `/release_memory_occupation` etc. requires new RPCs +
+handlers in those external packages (the pause/resume API is Python-only for the
+same reason). Tracked as a follow-up; the Engine Python API below is the
+RL-driver's actual interface and is complete.
+
+### Task 9 (original, deferred): HTTP routes
 
 **Files:**
 - Modify: `python/tokenspeed/runtime/entrypoints/http_server.py`
@@ -1149,7 +1160,14 @@ git add python/tokenspeed/runtime/execution/weight_loader.py python/tokenspeed/r
 git commit -s -m "feat(memory-saver): tag weights vs kv_cache allocation regions"
 ```
 
-### Task 11: Tag deepseek_v4 KV region (nv2-informed)
+### Task 11: Tag deepseek_v4 KV region — FOLLOW-ON
+
+**Decision (2026-06-08):** Initial GPU validation runs on a small MHA model
+(`mha.py` wrapping suffices). `deepseek_v4.py` (`del enable_memory_saver`, KV
+region unwrapped) is wrapped as a follow-on so the real serving model
+(DeepSeek-V4-Flash) supports sleep/wake. Steps below stand for that follow-on.
+
+### Task 11 (follow-on): Tag deepseek_v4 KV region (nv2-informed)
 
 **Files:**
 - Modify: `python/tokenspeed/runtime/layers/attention/kv_cache/deepseek_v4.py` (~767-791)
