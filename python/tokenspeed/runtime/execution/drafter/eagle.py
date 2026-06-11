@@ -150,6 +150,20 @@ class Eagle(BaseDrafter):
         """Map token ids through hot_token_ids if available, otherwise return as-is."""
         return self.hot_token_ids[ids] if self.hot_token_ids is not None else ids
 
+    @staticmethod
+    def _clamp_first_step_gather_ids(
+        gather_ids: torch.Tensor, input_num_tokens: int
+    ) -> torch.Tensor:
+        # Capture warmup runs verify on dummy logits; keep any bogus accept length
+        # from indexing past the synthetic first-step input.
+        return torch.clamp(gather_ids, max=input_num_tokens - 1)
+
+    @staticmethod
+    def _should_reduce_first_step(
+        forward_mode: ForwardMode, all_decode_or_idle: bool
+    ) -> bool:
+        return forward_mode.is_decode() or all_decode_or_idle
+
     def _get_first_step_input(
         self,
         draft_input: EagleDraftInput,
@@ -188,18 +202,27 @@ class Eagle(BaseDrafter):
 
             gather_ids = last_indices
             if num_decodes > 0:
+                decode_gather_ids = (
+                    self.padded_gather_ids_offsets_buf[:num_decodes]
+                    + draft_input.accept_lengths[num_extends:]
+                    + num_prefill_tokens
+                )
+                decode_gather_ids = self._clamp_first_step_gather_ids(
+                    decode_gather_ids, input_num_tokens
+                )
                 gather_ids = torch.cat(
                     [
                         gather_ids,
-                        self.padded_gather_ids_offsets_buf[:num_decodes]
-                        + draft_input.accept_lengths[num_extends:]
-                        + num_prefill_tokens,
+                        decode_gather_ids,
                     ]
                 )
         else:
             input_ids = draft_input.base_model_output
             gather_ids = (
                 self.padded_gather_ids_offsets_buf[:bs] + draft_input.accept_lengths
+            )
+            gather_ids = self._clamp_first_step_gather_ids(
+                gather_ids, input_num_tokens
             )
 
         return input_ids, gather_ids
@@ -218,7 +241,9 @@ class Eagle(BaseDrafter):
             draft_input, bs, draft_input.input_num_tokens
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
-        draft_first_step_reduce = forward_mode.is_decode()
+        draft_first_step_reduce = self._should_reduce_first_step(
+            forward_mode, draft_input.all_decode_or_idle
+        )
 
         # TODO: remove the isinstance/flag gate together with pre_attention_trim
         # once Qwen NextN and DeepSeek V3 NextN also pre-slice q.

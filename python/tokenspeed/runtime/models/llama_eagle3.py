@@ -190,7 +190,12 @@ class LlamaAttention(nn.Module):
             if ctx.draft_first_step_reduce:
                 # KV already written via fused_set_kv_buffer_arg above; slice Q
                 # to one query per request and route attn as decode.
-                q_rope = q_rope.index_select(0, ctx.gather_ids)
+                gather_ids = (
+                    ctx.local_gather_ids
+                    if ctx.local_gather_ids is not None
+                    else ctx.gather_ids
+                )
+                q_rope = q_rope.index_select(0, gather_ids)
                 attn_output = ctx.attn_backend.forward(
                     q_rope,
                     None,
@@ -217,7 +222,12 @@ class LlamaAttention(nn.Module):
             if ctx.draft_first_step_reduce:
                 # KV written by self.attn above; slice attn_output so o_proj
                 # and the rest of the layer only run on the live rows.
-                attn_output = attn_output.index_select(0, ctx.gather_ids)
+                gather_ids = (
+                    ctx.local_gather_ids
+                    if ctx.local_gather_ids is not None
+                    else ctx.gather_ids
+                )
+                attn_output = attn_output.index_select(0, gather_ids)
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -385,7 +395,12 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         )
         if ctx.draft_first_step_reduce and not ctx.forward_mode.is_idle():
             # Gather residual to self_attn's [bs, H]; idle has no gather_ids.
-            residual = residual.index_select(0, ctx.gather_ids)
+            gather_ids = (
+                ctx.local_gather_ids
+                if ctx.local_gather_ids is not None
+                else ctx.gather_ids
+            )
+            residual = residual.index_select(0, gather_ids)
 
         # Fused post-attn allreduce + norm (uses attn tp group)
         block_scale = None
@@ -453,7 +468,12 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         )
         if ctx.draft_first_step_reduce and not ctx.forward_mode.is_idle():
             # Gather residual to self_attn's [bs, H]; idle has no gather_ids.
-            residual = residual.index_select(0, ctx.gather_ids)
+            gather_ids = (
+                ctx.local_gather_ids
+                if ctx.local_gather_ids is not None
+                else ctx.gather_ids
+            )
+            residual = residual.index_select(0, gather_ids)
         hidden_states, residual = self.comm_manager.post_attn_comm(
             hidden_states, residual, ctx
         )

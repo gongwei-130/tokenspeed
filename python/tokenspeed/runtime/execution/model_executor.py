@@ -186,6 +186,11 @@ class ModelExecutor:
     Orchestrates model forward execution.
     """
 
+    @staticmethod
+    def _scatter_count(num_tokens: int, tp_size: int) -> list[int]:
+        base, remainder = divmod(int(num_tokens), int(tp_size))
+        return [base + 1] * remainder + [base] * (tp_size - remainder)
+
     def __init__(
         self,
         config: ModelExecutorConfig,
@@ -1422,6 +1427,33 @@ class ModelExecutor:
                     ctx.global_num_tokens = dp_global_num_tokens
                     ctx.global_bs = dp_global_bs
                     ctx.all_decode_or_idle = dp_all_decode_or_idle
+                    mapping = self.model_runner.mapping
+                    dp_base_rank = mapping.attn.dp_rank * mapping.attn.tp_size
+                    dp_num_tokens = dp_global_num_tokens[dp_base_rank]
+                    dp_token_counts = self._scatter_count(
+                        dp_num_tokens, mapping.attn.tp_size
+                    )
+                    ctx.dp_local_start_pos = sum(
+                        dp_token_counts[: mapping.attn.tp_rank]
+                    )
+                    ctx.dp_local_num_tokens = dp_token_counts[
+                        mapping.attn.tp_rank
+                    ]
+                    if gather_ids is not None:
+                        local_gather_ids = gather_ids - ctx.dp_local_start_pos
+                        local_gather_mask = (
+                            (local_gather_ids >= 0)
+                            & (local_gather_ids < ctx.dp_local_num_tokens)
+                        )
+                        ctx.local_gather_ids = local_gather_ids[
+                            local_gather_mask
+                        ]
+                        ctx.local_gather_positions = torch.arange(
+                            gather_ids.shape[0],
+                            dtype=torch.int64,
+                            device=gather_ids.device,
+                        )[local_gather_mask]
+                        ctx.gather_output_size = gather_ids.shape[0]
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_info = self._build_sampling_info(bs, sampling_params_list)
                     grammar_completion = setup_grammar_step(

@@ -53,13 +53,17 @@ def _scatter_count(num_tokens: int, tp_size: int) -> List[int]:
 
 
 def _scattered_num_tokens_all(ctx: ForwardContext, mapping: Mapping) -> List[int]:
-    if ctx.global_num_tokens is not None:
+    global_counts = (
+        ctx.global_bs if ctx.draft_first_step_reduce else ctx.global_num_tokens
+    )
+    if global_counts is not None:
         scattered: List[int] = []
         for attn_dp_rank in range(mapping.attn.dp_size):
-            num_tokens = ctx.global_num_tokens[attn_dp_rank * mapping.attn.tp_size]
+            num_tokens = global_counts[attn_dp_rank * mapping.attn.tp_size]
             scattered.extend(_scatter_count(num_tokens, mapping.attn.tp_size))
         return scattered
-    return _scatter_count(ctx.input_num_tokens, mapping.attn.tp_size)
+    num_tokens = ctx.bs if ctx.draft_first_step_reduce else ctx.input_num_tokens
+    return _scatter_count(num_tokens, mapping.attn.tp_size)
 
 
 def _group_scattered_num_tokens(
@@ -77,11 +81,15 @@ def _group_scattered_num_tokens(
         return _scattered_num_tokens_all(ctx, mapping)[start:end]
     elif group_type == ParallelGroup.MOE_TP_EP:
         tp_ep_size = mapping.moe.tp_ep_size
-        if ctx.global_num_tokens is not None:
+        global_counts = (
+            ctx.global_bs if ctx.draft_first_step_reduce else ctx.global_num_tokens
+        )
+        if global_counts is not None:
             start = mapping.moe.dp_rank * tp_ep_size
-            return list(ctx.global_num_tokens[start : start + tp_ep_size])
+            return _scattered_num_tokens_all(ctx, mapping)[start : start + tp_ep_size]
         result = [0] * tp_ep_size
-        result[mapping.moe.tp_ep_rank] = ctx.input_num_tokens
+        num_tokens = ctx.bs if ctx.draft_first_step_reduce else ctx.input_num_tokens
+        result[mapping.moe.tp_ep_rank] = num_tokens
         return result
     else:
         raise ValueError(f"Unknown parallel group type: {group_type}")

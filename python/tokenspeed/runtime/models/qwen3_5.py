@@ -749,7 +749,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         if ctx.draft_first_step_reduce:
             # Slice attn_output to [bs, H] so o_proj runs on live rows only.
-            attn_output = attn_output.index_select(0, ctx.gather_ids)
+            gather_ids = (
+                ctx.local_gather_ids
+                if ctx.local_gather_ids is not None
+                else ctx.gather_ids
+            )
+            attn_output = attn_output.index_select(0, gather_ids)
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -780,7 +785,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
             if ctx.draft_first_step_reduce:
                 # Gather residual to self_attention's [bs, H].
-                residual = residual.index_select(0, ctx.gather_ids)
+                gather_ids = (
+                    ctx.local_gather_ids
+                    if ctx.local_gather_ids is not None
+                    else ctx.gather_ids
+                )
+                residual = residual.index_select(0, gather_ids)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
             )

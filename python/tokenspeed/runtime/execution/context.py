@@ -59,6 +59,13 @@ class ForwardContext:
     global_num_tokens: list[int] | None = None
     global_bs: list[int] | None = None
     all_decode_or_idle: bool = False
+    # Token range owned by this rank after DP-attention token scatter. These
+    # positions are relative to the rank-local DP batch, before TP scattering.
+    dp_local_start_pos: int | None = None
+    dp_local_num_tokens: int | None = None
 
     # --- logits processor ---
     gather_ids: torch.Tensor | None = None
+    local_gather_ids: torch.Tensor | None = None
+    local_gather_positions: torch.Tensor | None = None
+    gather_output_size: int | None = None

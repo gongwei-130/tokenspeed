@@ -95,7 +95,7 @@ class CommManager:
         )
         if global_counts is not None:
             start = self.mapping.moe.dp_rank * tp_ep_size
-            return list(global_counts[start : start + tp_ep_size])
+            return self.scattered_num_tokens(ctx)[start : start + tp_ep_size]
         num_tokens = ctx.bs if ctx.draft_first_step_reduce else ctx.input_num_tokens
         result = [0] * tp_ep_size
         result[self.mapping.moe.tp_ep_rank] = num_tokens

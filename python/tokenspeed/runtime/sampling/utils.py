@@ -23,6 +23,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
+from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.utils import crash_on_warnings, get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -49,7 +50,7 @@ def nan_guard_logits(
     enable_nan_detection: bool,
 ) -> torch.Tensor:
     """Replace NaNs with -1e5 and optionally crash; no-op when detection is disabled."""
-    if not enable_nan_detection:
+    if not enable_nan_detection or get_is_capture_mode():
         return logits
 
     if not torch.any(torch.isnan(logits)):

@@ -20,9 +20,11 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cuda import (
     chain_speculative_sampling_target_only,
@@ -313,6 +315,12 @@ class FlashInferSamplingBackend(SamplingBackend):
         logits = nan_guard_logits(
             logits_output.next_token_logits, self.config.enable_nan_detection
         )
+        sample_output_indices = getattr(logits_output, "sample_output_indices", None)
+        sample_output_size = getattr(logits_output, "sample_output_size", None)
+        if sample_output_indices is not None:
+            sampling_info = self._slice_sampling_info(
+                sampling_info, sample_output_indices
+            )
 
         # Grammar bitmask apply — captured inside the CUDA graph. Buffer is
         # pre-bound by bind_grammar_mask_buf; non-grammar rows stay all-ones.
@@ -321,7 +329,11 @@ class FlashInferSamplingBackend(SamplingBackend):
                 logits=logits, vocab_mask=sampling_info.vocab_mask
             )
 
-        if sampling_info.is_all_greedy:
+        if logits.shape[0] == 0:
+            batch_next_token_ids = torch.empty(
+                (0,), dtype=torch.int32, device=logits.device
+            )
+        elif sampling_info.is_all_greedy:
 
             batch_next_token_ids = sampling_argmax(logits)
 
@@ -356,6 +368,19 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         sampled = batch_next_token_ids.to(torch.int32)
 
+        if sample_output_indices is not None:
+            sampled, lengths = self._merge_sample_outputs(
+                sampled,
+                sample_output_indices,
+                int(sample_output_size),
+            )
+            if self.config.enable_output_logprobs:
+                raise RuntimeError(
+                    "sample output logprobs are not supported for DP-local "
+                    "sample output merge"
+                )
+            return sampled, lengths
+
         # TP-rank sync: rank 0 wins.
         self.maybe_broadcast(sampled)
 
@@ -367,6 +392,46 @@ class FlashInferSamplingBackend(SamplingBackend):
         bs = logits.shape[0]
 
         return sampled, self._ones_buf[:bs]
+
+    def _slice_sampling_info(
+        self,
+        sampling_info: SamplingBatchInfo,
+        indices: torch.Tensor,
+    ) -> SamplingBatchInfo:
+        def index_tensor(t: torch.Tensor | None) -> torch.Tensor | None:
+            return t.index_select(0, indices) if t is not None else None
+
+        return dataclasses.replace(
+            sampling_info,
+            temperatures=index_tensor(sampling_info.temperatures),
+            top_ps=index_tensor(sampling_info.top_ps),
+            top_ks=index_tensor(sampling_info.top_ks),
+            min_ps=index_tensor(sampling_info.min_ps),
+            req_pool_indices=index_tensor(sampling_info.req_pool_indices),
+            vocab_mask=index_tensor(sampling_info.vocab_mask),
+        )
+
+    def _merge_sample_outputs(
+        self,
+        sampled: torch.Tensor,
+        indices: torch.Tensor,
+        output_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        merged_tokens = torch.zeros(
+            (output_size,), dtype=torch.int32, device=sampled.device
+        )
+        merged_lengths = torch.zeros(
+            (output_size,), dtype=torch.int32, device=sampled.device
+        )
+        if sampled.numel() > 0:
+            merged_tokens.scatter_(0, indices, sampled)
+            merged_lengths.scatter_(
+                0, indices, torch.ones_like(sampled, dtype=torch.int32)
+            )
+        if self._tp_pg is not None:
+            dist.all_reduce(merged_tokens, op=dist.ReduceOp.SUM, group=self._tp_pg)
+            dist.all_reduce(merged_lengths, op=dist.ReduceOp.SUM, group=self._tp_pg)
+        return merged_tokens, merged_lengths
 
     @nvtx_range("sampling:verify", color="yellow")
     def verify(
@@ -442,7 +507,7 @@ class FlashInferSamplingBackend(SamplingBackend):
                 .view(bs, num_tokens_per_req)
                 .fill_(-1)
             )
-            accept_length = self._accept_length_local_buf[:bs]
+            accept_length = self._accept_length_local_buf[:bs].fill_(0)
         else:
             pool_indices = sampling_info.req_pool_indices
             coins = self._coins_buf
@@ -453,7 +518,7 @@ class FlashInferSamplingBackend(SamplingBackend):
                 .view(bs, num_tokens_per_req)
                 .fill_(-1)
             )
-            accept_length = self._accept_length_buf[:bs]
+            accept_length = self._accept_length_buf[:bs].fill_(0)
 
         logits = nan_guard_logits(
             logits_output.next_token_logits, self.config.enable_nan_detection

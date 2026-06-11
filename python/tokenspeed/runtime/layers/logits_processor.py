@@ -62,6 +62,8 @@ class LogitsProcessorOutput:
     # The last hidden layers
     hidden_states: torch.Tensor | None = None
     logits_layout_plan: LogitsLayoutPlan | None = None
+    sample_output_indices: torch.Tensor | None = None
+    sample_output_size: int | None = None
 
     ## Part 2: Populated by the active SamplingBackend during sample()/verify().
     # The logprobs of the next tokens.                              shape: [#seq]
@@ -110,18 +112,33 @@ class LogitsMetadata:
     # Number of tokens in the request.
     global_num_tokens_gpu: torch.Tensor | None = None
     # The start position of local hidden states.
-    dp_local_start_pos: torch.Tensor | None = None
-    dp_local_num_tokens: torch.Tensor | None = None
+    dp_local_start_pos: int | None = None
+    dp_local_num_tokens: int | None = None
+    local_gather_positions: torch.Tensor | None = None
+    gather_output_size: int | None = None
     gathered_buffer: torch.Tensor | None = None
     # Buffer to gather logits from all ranks.
     forward_batch_gathered_buffer: torch.Tensor | None = None
 
     @classmethod
     def from_forward_context(cls, ctx: ForwardContext):
+        gather_ids = (
+            ctx.local_gather_ids
+            if ctx.local_gather_ids is not None
+            else ctx.gather_ids
+        )
         return cls(
             forward_mode=ctx.forward_mode,
             capture_hidden_mode=ctx.capture_hidden_mode,
-            gather_ids=ctx.gather_ids,
+            gather_ids=gather_ids,
+            dp_local_start_pos=(
+                None if ctx.local_gather_ids is not None else ctx.dp_local_start_pos
+            ),
+            dp_local_num_tokens=(
+                None if ctx.local_gather_ids is not None else ctx.dp_local_num_tokens
+            ),
+            local_gather_positions=getattr(ctx, "local_gather_positions", None),
+            gather_output_size=getattr(ctx, "gather_output_size", None),
         )
 
 
@@ -283,6 +300,28 @@ class LogitsProcessor(nn.Module):
             hidden_size=vocab_padded,
         )
 
+    @staticmethod
+    def _localize_gather_ids(
+        hidden_states: torch.Tensor,
+        gather_ids: torch.Tensor,
+        logits_metadata: LogitsMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        local_start = logits_metadata.dp_local_start_pos
+        local_num_tokens = logits_metadata.dp_local_num_tokens
+        if local_start is None or local_num_tokens is None:
+            return None
+        if hidden_states.shape[0] != local_num_tokens:
+            return None
+
+        local_ids = gather_ids - int(local_start)
+        local_mask = (local_ids >= 0) & (local_ids < int(local_num_tokens))
+        local_positions = torch.arange(
+            gather_ids.shape[0],
+            dtype=torch.int64,
+            device=gather_ids.device,
+        )[local_mask]
+        return local_ids[local_mask], local_positions
+
     def forward(
         self,
         input_ids,
@@ -293,11 +332,34 @@ class LogitsProcessor(nn.Module):
     ) -> LogitsProcessorOutput:
         # Get the last hidden states and last logits for the next token prediction
         if not logits_metadata.extend_return_logprob:
+            sample_output_indices = logits_metadata.local_gather_positions
+            sample_output_size = logits_metadata.gather_output_size
             gather_ids = logits_metadata.gather_ids
             if gather_ids is not None:
+                localized_gather = self._localize_gather_ids(
+                    hidden_states, gather_ids, logits_metadata
+                )
+                if localized_gather is not None:
+                    # DP attention can leave a rank with a local hidden slice
+                    # while gather_ids still describe the global request
+                    # layout. Translate to the local slice, or produce an
+                    # empty local batch when this rank owns no sampled token.
+                    local_gather_ids, sample_output_indices = localized_gather
+                    sample_output_size = gather_ids.shape[0]
+                    pruned_states = hidden_states[local_gather_ids]
+                    if aux_hidden_states is not None:
+                        aux_pruned_states = [
+                            h[local_gather_ids] for h in aux_hidden_states
+                        ]
+                elif hidden_states.shape[0] == 0:
+                    # Backward-compatible guard for callers that have not
+                    # populated DP-local range metadata yet.
+                    pruned_states = hidden_states
+                    if aux_hidden_states is not None:
+                        aux_pruned_states = list(aux_hidden_states)
                 # Shapes align iff midlayer already pruned to one row per request
                 # (draft first-step reduce). Other paths emit [N, H] with N > bs.
-                if gather_ids.shape[0] == hidden_states.shape[0]:
+                elif gather_ids.shape[0] == hidden_states.shape[0]:
                     pruned_states = hidden_states
                     if aux_hidden_states is not None:
                         aux_pruned_states = list(aux_hidden_states)
@@ -412,6 +474,8 @@ class LogitsProcessor(nn.Module):
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
                 logits_layout_plan=logits_layout_plan,
+                sample_output_indices=sample_output_indices,
+                sample_output_size=sample_output_size,
             )
         else:
             input_logprobs = logits[input_logprob_indices]
@@ -482,6 +546,10 @@ class LogitsProcessor(nn.Module):
         If sampled_logits_only is True, it means hidden_states only contain the
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
+
+        DP attention can leave an otherwise live rank with no local tokens. The
+        hidden/logits boundary treats that as a valid empty local batch and must
+        not launch an LM-head kernel for it.
         """
         dp_sampling = plan is not None
         assert (not dp_sampling) or self.dp_sampling_enabled, (
@@ -498,8 +566,19 @@ class LogitsProcessor(nn.Module):
                 hidden_states, plan
             )
 
+        empty_hidden = hidden_states.shape[0] == 0
+        if empty_hidden and (self.skip_all_gather or self.tp_size == 1):
+            vocab_size = int(self.config.vocab_size)
+            if hasattr(lm_head, "weight"):
+                dtype = lm_head.weight.dtype
+                device = lm_head.weight.device
+            else:
+                dtype = hidden_states.dtype
+                device = hidden_states.device
+            return torch.empty((0, vocab_size), dtype=dtype, device=device)
+
         if hasattr(lm_head, "weight"):
-            if self._use_fused_lm_head:
+            if self._use_fused_lm_head and not empty_hidden:
                 logits = _lm_head_matmul(hidden_states, lm_head.weight)
             else:
                 logits = torch.matmul(
